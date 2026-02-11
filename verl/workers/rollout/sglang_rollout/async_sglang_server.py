@@ -43,10 +43,9 @@ from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
-from verl.utils.profiler.profile import DistProfiler
+from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.workers.config import HFModelConfig, RolloutConfig
-from verl.workers.rollout.base import BaseRolloutServer, TokenOutput, resume_on_abort
-from verl.workers.rollout.replica import RolloutMode, RolloutReplica
+from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.sglang_rollout.sglang_rollout import ServerAdapter, _set_envs_and_config
 from verl.workers.rollout.utils import get_max_position_embeddings, run_unvicorn
 
@@ -56,88 +55,7 @@ logger.setLevel(logging.INFO)
 visible_devices_keyword = get_visible_devices_keyword()
 
 
-class SGLangProfilerArgsBuilder:
-    """Builder for SGLang profiling parameters, decoupling profiler parameter logic from the core service class."""
-
-    def __init__(
-        self,
-        profiler_controller: DistProfiler,
-        rollout_config: RolloutConfig,
-        replica_rank: int,
-    ):
-        self.profiler_controller = profiler_controller
-        self.rollout_config = rollout_config
-        self.replica_rank = replica_rank
-        self.auto_stop_profiling = False
-
-    def build_profile_args(self, **kwargs) -> dict[str, Any]:
-        global_step = kwargs.pop("global_step", 0)
-        config = self.profiler_controller.tool_config
-        contents = self.profiler_controller.tool_config.contents
-
-        save_path = os.path.join(
-            self.rollout_config.profiler.save_path,
-            f"rollout_step_{global_step}",
-            f"agent_loop_replica_{self.replica_rank}",
-        )
-        os.makedirs(save_path, exist_ok=True)
-
-        profiler_tool = self.rollout_config.profiler.tool
-        activities: Optional[list[str]] = None
-        if contents and profiler_tool:
-            activities_tmp = []
-            check_map = {
-                "cpu": ("CPU", "torch"),
-                "cuda|gpu": ("GPU", "torch"),
-                "MEM": ("MEM", "torch_memory"),
-            }
-            for key, (act, tool) in check_map.items():
-                if any(k in contents for k in key.split("|")):
-                    activities_tmp.append(act)
-                    if profiler_tool != tool:
-                        raise ValueError(f"{act} profiling requires '{tool}' (got '{profiler_tool}')")
-            for unsupported in ("CUDA_PROFILER", "RPD"):
-                if unsupported in contents:
-                    raise NotImplementedError(f"{unsupported} profiling is not supported")
-            activities = activities_tmp if len(activities_tmp) > 0 else activities
-
-        with_stack = bool(contents) and "stack" in contents
-        record_shapes = bool(contents) and "shapes" in contents
-        # Profiling by stage of Prefill or Decode
-        profile_by_stage = bool(contents) and "profile-by-stage" in contents
-        # Merge profiles from all ranks into a single trace
-        merge_profiles = bool(contents) and "merge-profiles" in contents
-
-        # Rollout start step must be greater than 0 for sglang
-        rollout_start_step = config.step_start if config.step_end is not None else 1
-        rollout_end_step = config.step_end if config.step_end is not None else -1
-        rollout_num_steps = rollout_end_step - rollout_start_step
-        self.auto_stop_profiling = rollout_num_steps > 0
-
-        # num_steps must be greater than 0 or None in SGLang.
-        rollout_num_steps = None if rollout_num_steps <= 0 else rollout_num_steps
-
-        if rollout_num_steps is None and profile_by_stage:
-            raise Exception(
-                "profile_by_stage requires rollout_num_steps to be set (possible limitation in sglang <= 0.5.5)"
-            )
-
-        # start_step must be greater than 0 for sglang
-        rollout_start_step = max(rollout_start_step, 1)
-
-        return {
-            "start_step": rollout_start_step,
-            "num_steps": rollout_num_steps,
-            "activities": activities,
-            "with_stack": with_stack,
-            "record_shapes": record_shapes,
-            "output_dir": save_path,
-            "profile_by_stage": profile_by_stage,
-            "merge_profiles": merge_profiles,
-        }, self.auto_stop_profiling
-
-
-class SGLangHttpServer(BaseRolloutServer):
+class SGLangHttpServer:
     """SGLang http server in single node, this is equivalent to launch server with command line:
     ```
     python -m sglang.launch_server --node-rank 0 --nnode 1 ...
@@ -164,7 +82,6 @@ class SGLangHttpServer(BaseRolloutServer):
         cuda_visible_devices: str,
         base_gpu_id: int,
     ):
-        super().__init__()
         print(f"SGLang http server: {rollout_mode=}, {replica_rank=}, {node_rank=}, {nnodes=}, {cuda_visible_devices=}")
         os.environ[visible_devices_keyword] = cuda_visible_devices
 
@@ -307,21 +224,17 @@ class SGLangHttpServer(BaseRolloutServer):
 
         # mtp
         if self.config.mtp.enable and self.config.mtp.enable_rollout:
+            # Enable weights CPU backup for sglang >= 0.5.6
+            if sglang.__version__ < "0.5.6":
+                raise ValueError(f"sglang version {sglang.__version__} is not supported for MTP rollout")
+
             args["speculative_algorithm"] = self.config.mtp.speculative_algorithm
             args["speculative_num_steps"] = self.config.mtp.speculative_num_steps
             args["speculative_eagle_topk"] = self.config.mtp.speculative_eagle_topk
             args["speculative_num_draft_tokens"] = self.config.mtp.speculative_num_draft_tokens
 
-            args["log_level"] = "info"
-            args["load_format"] = "auto"
-
-            # Enable weights CPU backup for sglang >= 0.5.6
-            if sglang.__version__ >= "0.5.6":
-                args["enable_weights_cpu_backup"] = True
-                args["enable_draft_weights_cpu_backup"] = True
-
-            # args['enable_memory_saver'] = False
-            # enable_memory_saver = False MTP success but memory can't be release
+            args["enable_weights_cpu_backup"] = True
+            args["enable_draft_weights_cpu_backup"] = True
 
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
@@ -397,10 +310,9 @@ class SGLangHttpServer(BaseRolloutServer):
             logger.info("skip sleep in standalone mode")
 
     async def clear_kv_cache(self):
-        obj = ReleaseMemoryOccupationReqInput(tags=["kv_cache"])
-        await self.tokenizer_manager.release_memory_occupation(obj, None)
+        if self.node_rank == 0:
+            await self.tokenizer_manager.flush_cache()
 
-    @resume_on_abort
     async def generate(
         self,
         prompt_ids: torch.Tensor,
@@ -452,8 +364,6 @@ class SGLangHttpServer(BaseRolloutServer):
         generate_request = GenerateReqInput(**request)
 
         output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
-        finish_reason = output["meta_info"]["finish_reason"]
-        finish_reason = finish_reason["type"] if finish_reason else None
         if return_logprob:
             output_token_logprobs = output["meta_info"]["output_token_logprobs"]
             log_probs, token_ids = zip(
@@ -481,9 +391,7 @@ class SGLangHttpServer(BaseRolloutServer):
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
 
-        return TokenOutput(
-            token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts, stop_reason=finish_reason
-        )
+        return TokenOutput(token_ids=token_ids, log_probs=log_probs, routed_experts=routed_experts)
 
     async def start_profile(self, **kwargs):
         if (
@@ -491,9 +399,9 @@ class SGLangHttpServer(BaseRolloutServer):
             and self.profiler_controller.check_this_rank()
             and self.profiler_controller.is_discrete_mode()
         ):
-            profile_args, self._auto_stop_profiling = SGLangProfilerArgsBuilder(
-                profiler_controller=self.profiler_controller, rollout_config=self.config, replica_rank=self.replica_rank
-            ).build_profile_args(**kwargs)
+            profile_args = build_sglang_profiler_args(
+                self.profiler_controller.config, self.profiler_controller.tool_config, self.replica_rank
+            )
             await self.tokenizer_manager.start_profile(**profile_args)
 
     async def stop_profile(self):
@@ -501,20 +409,8 @@ class SGLangHttpServer(BaseRolloutServer):
             self.profiler_controller.check_enable()
             and self.profiler_controller.check_this_rank()
             and self.profiler_controller.is_discrete_mode()
-            and not self._auto_stop_profiling
         ):
             await self.tokenizer_manager.stop_profile()
-
-    async def abort_all_requests(self):
-        """Abort all requests with partial rollout."""
-        self.resume_event.clear()
-
-        while True:
-            self.tokenizer_manager.abort_request(abort_all=True)
-            is_locked = await self.tokenizer_manager.model_update_lock.is_locked()
-            if not is_locked:
-                break
-            await asyncio.sleep(1.0)
 
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)

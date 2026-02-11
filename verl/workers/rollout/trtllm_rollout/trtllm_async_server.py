@@ -27,8 +27,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, SubRayResourcePool
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
-from verl.workers.rollout.base import BaseRolloutServer, TokenOutput, resume_on_abort
-from verl.workers.rollout.replica import RolloutMode, RolloutReplica
+from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.trtllm_rollout.trtllm_rollout import ServerAdapter
 from verl.workers.rollout.utils import get_max_position_embeddings, run_unvicorn
 
@@ -37,7 +36,7 @@ logger.setLevel(logging.INFO)
 
 
 @ray.remote
-class TRTLLMHttpServer(BaseRolloutServer):
+class TRTLLMHttpServer:
     """TensorRT LLM HTTP server in single node.
 
     Args:
@@ -64,7 +63,6 @@ class TRTLLMHttpServer(BaseRolloutServer):
         pgs: list[PlacementGroup] = None,
         bundle_indices: list[list[int]] = None,
     ):
-        super().__init__()
         os.environ["TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"] = "1"
         assert torch.cuda.is_available(), "TRTLLM http server should run on GPU node"
 
@@ -115,9 +113,11 @@ class TRTLLMHttpServer(BaseRolloutServer):
         from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
         from tensorrt_llm.serve import OpenAIServer
 
+        assert self.config.pipeline_model_parallel_size == 1, "pipeline_model_parallel_size > 1 is not supported yet"
+
         engine_kwargs = self.config.get("engine_kwargs", {}).get("trtllm", {}) or {}
         kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True,
+            enable_block_reuse=self.config.enable_prefix_caching,
             free_gpu_memory_fraction=self.config.gpu_memory_utilization,
         )
 
@@ -126,6 +126,9 @@ class TRTLLMHttpServer(BaseRolloutServer):
         llm_kwargs = {
             "model": self.model_config.local_path,
             "backend": "pytorch",
+            "dtype": self.config.dtype,
+            "enable_chunked_prefill": self.config.enable_chunked_prefill,
+            "skip_tokenizer_init": self.config.skip_tokenizer_init,
             "orchestrator_type": "ray",
             "ray_worker_extension_cls": "tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
             "kv_cache_config": kv_cache_config,
@@ -133,11 +136,13 @@ class TRTLLMHttpServer(BaseRolloutServer):
             "max_batch_size": self.config.max_num_seqs,
             "max_num_tokens": self.config.max_num_batched_tokens,
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
+            "pipeline_parallel_size": self.config.pipeline_model_parallel_size,
+            "moe_expert_parallel_size": self.config.expert_parallel_size,
             "trust_remote_code": self.model_config.trust_remote_code,
             "placement_groups": self.pgs,
             "placement_bundle_indices": self.bundle_indices,
             "per_worker_gpu_share": per_worker_gpu_share,
-            "enable_sleep": True,
+            "enable_sleep": self.config.enable_sleep_mode,
             "allreduce_strategy": "NCCL",
             "sampler_type": "TRTLLMSampler",
             **engine_kwargs,
@@ -173,7 +178,6 @@ class TRTLLMHttpServer(BaseRolloutServer):
         app = trtllm_server.app
         self._server_port, self._server_task = await run_unvicorn(app, None, self._server_address)
 
-    @resume_on_abort
     async def generate(
         self,
         prompt_ids: list[int],
@@ -226,15 +230,12 @@ class TRTLLMHttpServer(BaseRolloutServer):
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
-    async def abort_all_requests(self):
-        """Abort all requests with partial rollout."""
-        raise NotImplementedError
-
-    async def start_profile(self, **kwargs):
-        raise NotImplementedError
-
-    async def stop_profile(self, **kwargs):
-        raise NotImplementedError
+    async def report_device_ids(self) -> list[str]:
+        """Report GPU device UUIDs from TRT-LLM workers."""
+        return await self.llm.collective_rpc(
+            "report_device_id",
+            unique_reply_rank=0,
+        )
 
 
 _rollout_worker_actor_cls = ray.remote(ServerAdapter)
