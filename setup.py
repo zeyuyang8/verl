@@ -29,7 +29,7 @@ install_requires = [
     "datasets",
     "dill",
     "hydra-core",
-    "numpy<2.0.0",
+    "numpy",
     "pandas",
     "peft",
     "pyarrow>=19.0.0",
@@ -44,7 +44,13 @@ install_requires = [
     "tensorboard",
 ]
 
-TEST_REQUIRES = ["pytest", "pre-commit", "py-spy", "pytest-asyncio", "pytest-rerunfailures"]
+TEST_REQUIRES = [
+    "pytest",
+    "pre-commit",
+    "py-spy",
+    "pytest-asyncio",
+    "pytest-rerunfailures",
+]
 PRIME_REQUIRES = ["pyext"]
 GEO_REQUIRES = ["mathruler", "torchvision", "qwen_vl_utils"]
 GPU_REQUIRES = ["liger-kernel", "flash-attn"]
